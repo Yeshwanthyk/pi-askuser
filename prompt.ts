@@ -1,5 +1,9 @@
 /** Model-facing schema descriptions for ask_user questions and answer options. */
+import type { AskUserAnswer } from "./interaction.ts";
+
 export const ASK_USER_PARAMETER_DESCRIPTIONS = {
+  header:
+    "Optional compact single-line label for this question (at most 24 characters), used in progress and review. The stable id remains canonical.",
   sharedContext:
     "Optional short evidence or rationale shown once above the question batch. Do not repeat a question here.",
   id: "Unique non-empty machine identifier for this question within the call",
@@ -7,6 +11,8 @@ export const ASK_USER_PARAMETER_DESCRIPTIONS = {
     "Optional short evidence or rationale shown above this question. Do not repeat the question here.",
   optional:
     "Whether the user may skip this question. Defaults to false: required questions must be answered before submission. This is independent of optional context.",
+  multiSelect:
+    "Whether the user may select multiple configured options plus one custom value. Defaults to false.",
   optionLabel: "Short non-empty display label for this option",
   optionDescription: "Optional one-line description shown below the label",
   question: "The non-empty user-facing question to ask",
@@ -17,7 +23,7 @@ export const ASK_USER_PARAMETER_DESCRIPTIONS = {
 };
 
 export const ASK_USER_TOOL_DESCRIPTION =
-  "Ask 1-10 independent multiple-choice questions answerable now. Each has 2-5 options plus an automatic free-form answer and may be marked optional so the user can skip it. Context may provide decision-relevant evidence or rationale. Never batch contingent follow-ups.";
+  "Ask 1-10 independent single- or multi-select questions answerable now. Each has 2-5 options plus an automatic free-form answer and may be marked optional so the user can skip it. Context may provide decision-relevant evidence or rationale. Never batch contingent follow-ups.";
 
 export const ASK_USER_PROMPT_SNIPPET =
   "Ask 1-10 independent multiple-choice questions, with explicitly optional questions when appropriate";
@@ -26,6 +32,8 @@ export const ASK_USER_PROMPT_GUIDELINES = [
   "When asking questions whose likely answers can be enumerated, use ask_user instead of asking in plain text.",
   "Choose 1-10 questions based on how many independent answers are useful now. Never batch contingent follow-ups that require a prior answer.",
   "Questions are required by default. Set a question's optional field to true only when proceeding without its answer is acceptable; this is unrelated to optional context.",
+  "Set multiSelect only when several answers may apply. Leave it false for mutually exclusive choices.",
+  "Use each question's optional header as a compact progress/review label (24 characters maximum); keep id stable for machine identity.",
   "Use ask_user context only for evidence or rationale that helps the user decide; do not put or repeat the question itself in context.",
 ];
 
@@ -35,11 +43,7 @@ export interface ResultQuestion {
   optional: boolean;
 }
 
-export interface ResultAnswer extends Pick<ResultQuestion, "id" | "question"> {
-  answer: string;
-  wasCustom: boolean;
-  index?: number;
-}
+export type ResultAnswer = AskUserAnswer;
 
 /** Builds the behavioral tool-result message returned to the parent model. */
 export function buildAskUserResultMessage(
@@ -71,9 +75,15 @@ export function buildAskUserResultMessage(
           }
           return `${label}: not answered (required)`;
         }
-        if (answer.wasCustom) {
-          return `${label}: user wrote: ${answer.answer}`;
+        if (answer.multiSelect === true) {
+          const selections = answer.selections.map((selection) =>
+            selection.wasCustom
+              ? `user wrote: ${selection.answer}`
+              : `user selected option ${selection.index}: ${selection.answer}`,
+          );
+          return `${label}: ${selections.join("; ")}`;
         }
+        if (answer.wasCustom) return `${label}: user wrote: ${answer.answer}`;
         return `${label}: user selected option ${answer.index}: ${answer.answer}`;
       });
       if (outcome.kind === "dismissed") {

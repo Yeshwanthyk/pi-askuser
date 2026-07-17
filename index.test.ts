@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
 import {
   AskUserParams,
   buildAskUserDetails,
-  findNextUnansweredIndex,
-  firstMissingRequiredIndex,
   parseAskUserArguments,
-  savedCustomText,
-  savedOptionIndex,
+  renderAskUserCall,
 } from "./index.ts";
 import { buildAskUserResultMessage } from "./prompt.ts";
 
@@ -18,6 +16,41 @@ const question = (id: string, optional?: boolean) => ({
   question: `${id}?`,
   options,
   ...(optional === undefined ? {} : { optional }),
+});
+const plainTheme: Pick<Theme, "fg" | "bold"> = {
+  fg: (_color, text) => text,
+  bold: (text) => text,
+};
+const renderCall = (args: unknown, argsComplete: boolean) =>
+  renderAskUserCall(args, plainTheme, argsComplete)
+    .render(500)
+    .map((line) => line.trimEnd())
+    .join("\n");
+
+test("renders incomplete partial arguments as a neutral call header", () => {
+  assert.equal(renderCall({ questions: [{ id: "deploy" }] }, false), "ask_user");
+});
+
+test("renders completed malformed arguments as invalid", () => {
+  assert.equal(
+    renderCall({ questions: [{ id: "deploy" }] }, true),
+    "ask_user invalid arguments",
+  );
+});
+
+test("preserves completed valid single and multi-question summaries", () => {
+  assert.equal(
+    renderCall({ questions: [question("deploy")] }, true),
+    "ask_user deploy?\n  1. Yes  2. No",
+  );
+  assert.equal(
+    renderCall({ questions: [{ ...question("deploy"), header: "Deployment" }] }, true),
+    "ask_user Deployment\n  1. Yes  2. No",
+  );
+  assert.equal(
+    renderCall({ questions: [{ ...question("region"), header: "Region" }, question("tier")] }, true),
+    "ask_user 2 questions (Region, tier)",
+  );
 });
 
 test("accepts only the strict current input shape", () => {
@@ -50,7 +83,12 @@ test("accepts 10 questions and rejects 11", () => {
   assert.equal(Check(AskUserParams, eleven), false);
 });
 
-test("validates optional and other strict question fields", () => {
+test("validates per-question headers, multi-select, optional, and strict fields", () => {
+  const extended = {
+    questions: [{ ...question("notes", true), header: "Release notes", multiSelect: true }],
+  };
+  assert.deepEqual(parseAskUserArguments(extended), extended);
+  assert.equal(Check(AskUserParams, extended), true);
   assert.equal(Check(AskUserParams, { questions: [question("notes", true)] }), true);
   assert.equal(Check(AskUserParams, { questions: [question("notes", false)] }), true);
   const optionalSchema = AskUserParams.properties.questions.items.properties.optional;
@@ -77,6 +115,54 @@ test("validates optional and other strict question fields", () => {
     () => parseAskUserArguments({ questions: [{ ...question("q"), extra: true }] }),
     /unsupported field/,
   );
+  for (const header of ["", "   ", "line one\nline two", "x".repeat(25)]) {
+    const args = { questions: [{ ...question("q"), header }] };
+    assert.equal(Check(AskUserParams, args), false, `schema accepted ${JSON.stringify(header)}`);
+    assert.throws(() => parseAskUserArguments(args), /header/);
+  }
+  const topLevelHeader = { header: "Batch", questions: [question("q")] };
+  assert.equal(Check(AskUserParams, topLevelHeader), false);
+  assert.throws(() => parseAskUserArguments(topLevelHeader), /unsupported field/);
+});
+
+test("keeps schema and parser whitespace rules aligned for every string field", () => {
+  const cases: Array<{
+    name: string;
+    args: unknown;
+    accepted: boolean;
+  }> = [
+    { name: "id", args: { questions: [{ ...question("q"), id: "   " }] }, accepted: false },
+    { name: "question", args: { questions: [{ ...question("q"), question: "   " }] }, accepted: false },
+    { name: "header", args: { questions: [{ ...question("q"), header: "   " }] }, accepted: false },
+    {
+      name: "option label",
+      args: { questions: [{ ...question("q"), options: [{ label: "   " }, options[1]] }] },
+      accepted: false,
+    },
+    {
+      name: "option description",
+      args: { questions: [{ ...question("q"), options: [{ label: "Yes", description: "   " }, options[1]] }] },
+      accepted: true,
+    },
+    { name: "question context", args: { questions: [{ ...question("q"), context: "   " }] }, accepted: false },
+    { name: "shared context", args: { context: "   ", questions: [question("q")] }, accepted: false },
+  ];
+
+  for (const { name, args, accepted } of cases) {
+    assert.equal(Check(AskUserParams, args), accepted, `${name} schema result`);
+    if (accepted) assert.doesNotThrow(() => parseAskUserArguments(args), name);
+    else assert.throws(() => parseAskUserArguments(args), Error, name);
+  }
+});
+
+test("counts header limits by Unicode code points", () => {
+  const accepted = { questions: [{ ...question("q"), header: "🙂".repeat(24) }] };
+  const rejected = { questions: [{ ...question("q"), header: "🙂".repeat(25) }] };
+
+  assert.equal(Check(AskUserParams, accepted), true);
+  assert.doesNotThrow(() => parseAskUserArguments(accepted));
+  assert.equal(Check(AskUserParams, rejected), false);
+  assert.throws(() => parseAskUserArguments(rejected), /at most 24 characters/);
 });
 
 test("formats completion with answered, skipped, and untouched optional questions", () => {
@@ -104,6 +190,26 @@ test("formats completion with answered, skipped, and untouched optional question
       "[tier] Tier?: skipped (optional)",
       "[notes] Notes?: not answered (optional)",
     ].join("\n"),
+  );
+});
+
+test("formats multi-select results with configured and custom provenance", () => {
+  assert.equal(
+    buildAskUserResultMessage({
+      kind: "completed",
+      questions: [{ id: "targets", question: "Targets?", optional: false }],
+      answers: [{
+        id: "targets",
+        question: "Targets?",
+        multiSelect: true,
+        selections: [
+          { answer: "Linux", wasCustom: false, index: 1 },
+          { answer: "FreeBSD", wasCustom: true },
+        ],
+      }],
+      skippedOptionalQuestionIds: [],
+    }),
+    "[targets] Targets?: user selected option 1: Linux; user wrote: FreeBSD",
   );
 });
 
@@ -144,49 +250,12 @@ test("formats dismissal with all partial rows and no inference", () => {
   );
 });
 
-test("required gating ignores unanswered optional questions", () => {
-  const questions = [question("required"), question("optional", true), question("later")];
-  assert.equal(firstMissingRequiredIndex(questions, new Set()), 0);
-  assert.equal(firstMissingRequiredIndex(questions, new Set(["required"])), 2);
-  assert.equal(
-    firstMissingRequiredIndex(questions, new Set(["required", "later"])),
-    undefined,
-  );
-});
-
-test("restores saved model and custom option cursors", () => {
-  assert.equal(
-    savedOptionIndex(3, {
-      id: "region",
-      question: "Region?",
-      answer: "EU",
-      wasCustom: false,
-      index: 2,
-    }),
-    1,
-  );
-  const custom = {
-    id: "notes",
-    question: "Notes?",
-    answer: "Keep the current layout",
-    wasCustom: true,
-  };
-  assert.equal(savedOptionIndex(3, custom), 3);
-  assert.equal(savedCustomText(custom), "Keep the current layout");
-  assert.equal(savedOptionIndex(3, undefined), 0);
-  assert.equal(savedCustomText(undefined), "");
-});
-
-test("finds the next unresolved question cyclically", () => {
-  const ids = ["first", "second", "third"];
-  assert.equal(findNextUnansweredIndex(ids, new Set(["second"]), 2), 0);
-  assert.equal(findNextUnansweredIndex(ids, new Set(["first", "third"]), 2), 1);
-  assert.equal(findNextUnansweredIndex(ids, new Set(ids), 1), undefined);
-});
-
-test("details include optional flags, skips, and distinct statuses", () => {
+test("details include headers, multi-select flags, skips, and distinct statuses", () => {
   const input = parseAskUserArguments({
-    questions: [question("proceed"), question("notes", true)],
+    questions: [
+      { ...question("proceed"), header: "Proceed", multiSelect: true },
+      question("notes", true),
+    ],
   });
   const answer = {
     id: "proceed",
@@ -198,8 +267,12 @@ test("details include optional flags, skips, and distinct statuses", () => {
 
   for (const status of ["completed", "dismissed", "cancelled", "no-ui"] as const) {
     const details = buildAskUserDetails(input, [answer], ["notes"], status);
+    assert.deepEqual(details.questions.map(({ header }) => header), ["Proceed", undefined]);
+    assert.deepEqual(details.questions.map(({ multiSelect }) => multiSelect), [true, false]);
     assert.deepEqual(details.questions.map(({ optional }) => optional), [false, true]);
-    assert.deepEqual(details.skippedOptionalQuestionIds, ["notes"]);
+    const scrubbed = status === "cancelled" || status === "no-ui";
+    assert.deepEqual(details.answers, scrubbed ? [] : [answer]);
+    assert.deepEqual(details.skippedOptionalQuestionIds, scrubbed ? [] : ["notes"]);
     assert.equal(details.status, status);
     assert.equal(details.cancelled, status === "cancelled");
   }

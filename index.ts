@@ -281,6 +281,128 @@ function interactionQuestions(input: AskUserInput): InteractionQuestion[] {
   }));
 }
 
+// Headless fallback: outside the TUI (RPC/web clients like pi-web/pican),
+// ctx.ui.custom() is unavailable, but the standard dialog methods
+// (select/input/confirm) travel over pi's extension_ui_request protocol and
+// render in any client that implements it. This is the canonical degradation
+// path for interactive extensions: ctx.ui.custom() when mode === "tui",
+// standard dialogs otherwise.
+const OTHER_CHOICE = "✏️ Other…";
+const SKIP_CHOICE = "⏭ Skip (optional)";
+const DONE_CHOICE = "✓ Done";
+
+interface DialogUI {
+  select(title: string, options: string[]): Promise<string | undefined>;
+  input(title: string, placeholder?: string): Promise<string | undefined>;
+  notify?(message: string, type?: "info" | "warning" | "error"): void;
+}
+
+function choiceLabel(option: { label: string; description?: string }): string {
+  return option.description ? `${option.label} — ${option.description}` : option.label;
+}
+
+export async function runDialogInteraction(
+  ui: DialogUI,
+  input: AskUserInput,
+  questions: InteractionQuestion[],
+  signal: AbortSignal | undefined,
+): Promise<InteractionResult> {
+  const answers: AskUserAnswer[] = [];
+  const skippedOptionalQuestionIds: string[] = [];
+  const dismissed = (): InteractionResult => ({ answers, skippedOptionalQuestionIds, status: "dismissed" });
+
+  if (input.context) ui.notify?.(input.context, "info");
+
+  for (const [index, question] of questions.entries()) {
+    if (signal?.aborted) return { answers: [], skippedOptionalQuestionIds: [], status: "cancelled" };
+    const source = input.questions[index];
+    const labels = source.options.map(choiceLabel);
+    const title = source.context ? `${question.question} (${source.context})` : question.question;
+
+    if (!question.multiSelect) {
+      const choices = [...labels, OTHER_CHOICE, ...(question.optional ? [SKIP_CHOICE] : [])];
+      let resolved = false;
+      while (!resolved) {
+        const picked = await ui.select(title, choices);
+        if (picked === undefined) return dismissed();
+        if (picked === SKIP_CHOICE) {
+          skippedOptionalQuestionIds.push(question.id);
+          resolved = true;
+        } else if (picked === OTHER_CHOICE) {
+          const custom = await ui.input(title, "Type your answer");
+          if (custom === undefined) continue; // back to the options
+          answers.push({ id: question.id, question: question.question, answer: custom, wasCustom: true });
+          resolved = true;
+        } else {
+          const optionIndex = choices.indexOf(picked);
+          answers.push({
+            id: question.id,
+            question: question.question,
+            answer: source.options[optionIndex]?.label ?? picked,
+            wasCustom: false,
+            index: optionIndex,
+          });
+          resolved = true;
+        }
+      }
+      continue;
+    }
+
+    const selectedIndices = new Set<number>();
+    const customTexts: string[] = [];
+    let done = false;
+    while (!done) {
+      const choices = [
+        ...labels.map((label, i) => `${selectedIndices.has(i) ? "[x]" : "[ ]"} ${label}`),
+        ...customTexts.map((text) => `[x] ${text}`),
+        OTHER_CHOICE,
+        DONE_CHOICE,
+        ...(question.optional ? [SKIP_CHOICE] : []),
+      ];
+      const picked = await ui.select(`${title} (select all that apply)`, choices);
+      if (picked === undefined) return dismissed();
+      if (picked === SKIP_CHOICE) {
+        skippedOptionalQuestionIds.push(question.id);
+        done = true;
+      } else if (picked === OTHER_CHOICE) {
+        const custom = await ui.input(title, "Type your answer");
+        if (custom !== undefined) customTexts.push(custom);
+      } else if (picked === DONE_CHOICE) {
+        if (selectedIndices.size === 0 && customTexts.length === 0) {
+          if (question.optional) {
+            skippedOptionalQuestionIds.push(question.id);
+          } else {
+            ui.notify?.("Select at least one option", "warning");
+            continue;
+          }
+        } else {
+          const selections = [
+            ...[...selectedIndices].sort((a, b) => a - b).map((i) => ({
+              answer: source.options[i].label,
+              wasCustom: false,
+              index: i,
+            })),
+            ...customTexts.map((text) => ({ answer: text, wasCustom: true })),
+          ];
+          answers.push({ id: question.id, question: question.question, multiSelect: true, selections });
+        }
+        done = true;
+      } else {
+        const choiceIndex = choices.indexOf(picked);
+        if (choiceIndex >= 0 && choiceIndex < labels.length) {
+          if (selectedIndices.has(choiceIndex)) selectedIndices.delete(choiceIndex);
+          else selectedIndices.add(choiceIndex);
+        } else {
+          const customIndex = choiceIndex - labels.length;
+          if (customIndex >= 0 && customIndex < customTexts.length) customTexts.splice(customIndex, 1);
+        }
+      }
+    }
+  }
+
+  return { answers, skippedOptionalQuestionIds, status: "completed" };
+}
+
 export function buildAskUserDetails(
   input: AskUserInput,
   answers: AskUserAnswer[],
@@ -412,8 +534,25 @@ export default function askUser(pi: ExtensionAPI) {
         details: buildAskUserDetails(params, answers, skippedOptionalQuestionIds, status),
       });
 
-      if (ctx.mode !== "tui") return reply(buildAskUserResultMessage({ kind: "no-ui" }), [], [], "no-ui");
       if (signal?.aborted) return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
+
+      if (ctx.mode !== "tui") {
+        // Headless (RPC/web client): fall back to the standard dialog methods,
+        // which travel over pi's extension_ui_request protocol.
+        if (typeof ctx.ui?.select !== "function" || typeof ctx.ui?.input !== "function") {
+          return reply(buildAskUserResultMessage({ kind: "no-ui" }), [], [], "no-ui");
+        }
+        const result = await runDialogInteraction(ctx.ui, params, questions, signal);
+        const resultQuestions = params.questions.map(({ id, question, optional }) => ({ id, question, optional: optional ?? false }));
+        if (result.status === "cancelled") return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
+        const outcome = {
+          kind: result.status,
+          questions: resultQuestions,
+          answers: result.answers,
+          skippedOptionalQuestionIds: result.skippedOptionalQuestionIds,
+        } as const;
+        return reply(buildAskUserResultMessage(outcome), result.answers, result.skippedOptionalQuestionIds, result.status);
+      }
 
       const showQuestions = (uiSignal: AbortSignal) =>
         ctx.ui.custom<InteractionResult>((tui, theme, keybindings, done) => {

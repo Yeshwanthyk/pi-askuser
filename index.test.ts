@@ -7,6 +7,7 @@ import {
   buildAskUserDetails,
   parseAskUserArguments,
   renderAskUserCall,
+  runDialogInteraction,
 } from "./index.ts";
 import { buildAskUserResultMessage } from "./prompt.ts";
 
@@ -283,4 +284,64 @@ test("cancellation does not imply user intent", () => {
     buildAskUserResultMessage({ kind: "cancelled" }),
     "The ask_user interaction was cancelled or aborted. Do not infer user intent from cancellation.",
   );
+});
+
+test("dialog fallback answers single- and multi-select questions headlessly", async () => {
+  const input = parseAskUserArguments({
+    questions: [
+      question("first"),
+      { id: "second", question: "second?", options, multiSelect: true },
+      question("third", true),
+    ],
+  });
+  const questions = input.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    options: q.options,
+    optional: q.optional ?? false,
+    multiSelect: q.multiSelect ?? false,
+  }));
+  const selects: Array<(choices: string[]) => string | undefined> = [
+    () => "Yes",
+    (choices) => choices[1], // toggle "No — Not now"
+    () => "✏️ Other…",
+    () => "✓ Done",
+    () => "⏭ Skip (optional)",
+  ];
+  const ui = {
+    select: async (_title: string, choices: string[]) => selects.shift()?.(choices),
+    input: async () => "custom text",
+  };
+  const result = await runDialogInteraction(ui, input, questions, undefined);
+  assert.equal(result.status, "completed");
+  assert.equal(result.answers.length, 2);
+  assert.deepEqual(result.answers[0], { id: "first", question: "first?", answer: "Yes", wasCustom: false, index: 0 });
+  const multi = result.answers[1];
+  assert.equal(multi.multiSelect, true);
+  if (multi.multiSelect === true) {
+    assert.deepEqual(
+      multi.selections.map((s: { answer: string; wasCustom: boolean }) => [s.answer, s.wasCustom]),
+      [["No", false], ["custom text", true]],
+    );
+  }
+  assert.deepEqual(result.skippedOptionalQuestionIds, ["third"]);
+});
+
+test("dialog fallback treats a cancelled dialog as dismissed with partial answers", async () => {
+  const input = parseAskUserArguments({ questions: [question("a"), question("b")] });
+  const questions = input.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    options: q.options,
+    optional: q.optional ?? false,
+    multiSelect: q.multiSelect ?? false,
+  }));
+  const selects = [() => "Yes", () => undefined];
+  const ui = {
+    select: async () => selects.shift()?.(),
+    input: async () => undefined,
+  };
+  const result = await runDialogInteraction(ui, input, questions, undefined);
+  assert.equal(result.status, "dismissed");
+  assert.equal(result.answers.length, 1);
 });

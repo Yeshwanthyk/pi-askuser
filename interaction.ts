@@ -165,13 +165,30 @@ function removeKey<T>(record: Record<string, T>, key: string): Record<string, T>
   return Object.fromEntries(entries);
 }
 
+export function shouldAutoCompleteSimpleBatch(
+  questions: ReadonlyArray<InteractionQuestion>,
+  state: InteractionState,
+): boolean {
+  return (
+    questions.length > 1 &&
+    questions.every((question) => !question.optional && !question.multiSelect) &&
+    questions.every((question) => isQuestionAnswered(state, question.id)) &&
+    Object.values(state.answers).every(
+      (answer) => answer.multiSelect !== true && !answer.wasCustom,
+    )
+  );
+}
+
 function withResolvedAdvance(
   questions: ReadonlyArray<InteractionQuestion>,
   state: InteractionState,
 ): InteractionState {
   if (questions.length === 1) return { ...state, status: "completed" };
   const next = findNextUnresolvedIndex(questions, state, state.current);
-  return { ...state, current: next ?? questions.length };
+  const advanced = { ...state, current: next ?? questions.length };
+  return shouldAutoCompleteSimpleBatch(questions, advanced)
+    ? { ...advanced, status: "completed" }
+    : advanced;
 }
 
 export function reduceInteraction(

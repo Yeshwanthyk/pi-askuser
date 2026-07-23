@@ -5,6 +5,8 @@ import { Check } from "typebox/value";
 import {
   AskUserParams,
   buildAskUserDetails,
+  InteractionQueue,
+  normalizeAskUserArguments,
   parseAskUserArguments,
   renderAskUserCall,
   runDialogInteraction,
@@ -52,6 +54,33 @@ test("preserves completed valid single and multi-question summaries", () => {
     renderCall({ questions: [{ ...question("region"), header: "Region" }, question("tier")] }, true),
     "ask_user 2 questions (Region, tier)",
   );
+});
+
+test("normalizes Opus decoration while leaving valid Sol arguments unchanged", () => {
+  const sol = { questions: [question("deploy")] };
+  assert.strictEqual(normalizeAskUserArguments(sol), sol);
+
+  const opus = {
+    questions: [{
+      ...question("roles"),
+      options: [
+        { label: "Simple", aside: "Least overlap" },
+        { label: "Advanced", description: "Keep all integrations", aside: "More control" },
+      ],
+    }],
+  };
+  assert.equal(Check(AskUserParams, opus), false);
+  const normalized = normalizeAskUserArguments(opus);
+  assert.deepEqual(normalized, {
+    questions: [{
+      ...question("roles"),
+      options: [
+        { label: "Simple", description: "Least overlap" },
+        { label: "Advanced", description: "Keep all integrations" },
+      ],
+    }],
+  });
+  assert.equal(Check(AskUserParams, normalized), true);
 });
 
 test("accepts only the strict current input shape", () => {
@@ -284,6 +313,34 @@ test("cancellation does not imply user intent", () => {
     buildAskUserResultMessage({ kind: "cancelled" }),
     "The ask_user interaction was cancelled or aborted. Do not infer user intent from cancellation.",
   );
+});
+
+test("serializes interactions and lets an aborted waiter leave the queue", async () => {
+  const queue = new InteractionQueue();
+  const releaseFirst = await queue.acquire();
+  assert.ok(releaseFirst);
+
+  let secondAcquired = false;
+  const second = queue.acquire().then((release) => {
+    secondAcquired = true;
+    return release;
+  });
+  await Promise.resolve();
+  assert.equal(secondAcquired, false);
+
+  const abortController = new AbortController();
+  const aborted = queue.acquire(abortController.signal);
+  abortController.abort();
+  assert.equal(await aborted, undefined);
+
+  releaseFirst();
+  const releaseSecond = await second;
+  assert.ok(releaseSecond);
+  releaseSecond();
+
+  const releaseThird = await queue.acquire();
+  assert.ok(releaseThird);
+  releaseThird();
 });
 
 test("dialog fallback answers single- and multi-select questions headlessly", async () => {

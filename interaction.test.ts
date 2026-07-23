@@ -10,6 +10,7 @@ import {
   orderedAnswers,
   orderedSkippedIds,
   reduceInteraction,
+  shouldAutoCompleteSimpleBatch,
   type InteractionQuestion,
   type InteractionState,
 } from "./interaction.ts";
@@ -244,6 +245,44 @@ test("required gating accepts only committed non-empty answers", () => {
   assert.equal(firstMissingRequiredIndex(questions, emptyMulti), 0);
   assert.equal(firstMissingRequiredIndex([question("required", { multiSelect: true })], draftOnly), 0);
   assert.strictEqual(reduce(questions, emptySingle, { type: "complete" }), emptySingle);
+});
+
+test("auto-completes a simple configured batch on its final answer", () => {
+  const questions = [question("topic"), question("depth"), question("count")];
+  let state = createInteractionState();
+  state = reduce(questions, state, { type: "selectOption", optionIndex: 0 });
+  assert.equal(state.status, "active");
+  state = reduce(questions, state, { type: "selectOption", optionIndex: 1 });
+  assert.equal(state.status, "active");
+  state = reduce(questions, state, { type: "selectOption", optionIndex: 2 });
+
+  assert.equal(shouldAutoCompleteSimpleBatch(questions, state), true);
+  assert.equal(state.status, "completed");
+  assert.equal(state.current, questions.length);
+});
+
+test("retains review for custom, optional, and multi-select batches", () => {
+  const customQuestions = [question("first"), question("second")];
+  let custom = createInteractionState();
+  custom = reduce(customQuestions, custom, { type: "submitCustom", text: "Custom" });
+  custom = reduce(customQuestions, custom, { type: "selectOption", optionIndex: 0 });
+  assert.equal(custom.status, "active");
+  assert.equal(custom.current, customQuestions.length);
+
+  const optionalQuestions = [question("first"), question("second", { optional: true })];
+  let optional = createInteractionState();
+  optional = reduce(optionalQuestions, optional, { type: "selectOption", optionIndex: 0 });
+  optional = reduce(optionalQuestions, optional, { type: "skip" });
+  assert.equal(optional.status, "active");
+  assert.equal(optional.current, optionalQuestions.length);
+
+  const multiQuestions = [question("first"), question("second", { multiSelect: true })];
+  let multi = createInteractionState();
+  multi = reduce(multiQuestions, multi, { type: "selectOption", optionIndex: 0 });
+  multi = reduce(multiQuestions, multi, { type: "selectOption", optionIndex: 1 });
+  multi = reduce(multiQuestions, multi, { type: "commitMulti" });
+  assert.equal(multi.status, "active");
+  assert.equal(multi.current, multiQuestions.length);
 });
 
 test("orders answers and explicit skips by question order", () => {

@@ -44,13 +44,16 @@ Choose 1–10 questions based on how many independent answers are useful now. Do
 ### Multiple questions
 
 - Only the current question is expanded. Committing a single-select answer, committing a multi-select draft with **Done selecting**, or skipping an optional question advances to the next unresolved question.
+- A batch containing only required single-select questions submits immediately when its final configured answer is selected.
 - `Tab` / `→` and `Shift+Tab` / `←` navigate while retaining answers, skips, cursor position, and custom text.
 - Returning to a skipped optional question shows its skipped state. Selecting an answer clears that state.
-- Review distinguishes answered, skipped optional, untouched optional, and missing required questions.
-- Confirm submits once all required questions are answered; optional questions may remain skipped or unanswered. Otherwise it jumps to the first missing required question.
+- Batches with optional, multi-select, or custom answers retain review, which distinguishes answered, skipped optional, untouched optional, and missing required questions.
+- On review, Confirm submits once all required questions are answered; otherwise it jumps to the first missing required question.
 - Cancel dismisses and returns every retained answer and explicit missing/skipped rows.
 
-Tool aborts remain `cancelled`, distinct from user dismissal, and do not imply user intent. In non-TUI modes the result instructs the model to ask in plain text.
+Tool aborts remain `cancelled`, distinct from user dismissal, and do not imply user intent. Concurrent calls are serialized so one interaction cannot displace another. In non-TUI modes the result instructs the model to ask in plain text.
+
+The public schema remains strict. Before validation, the extension normalizes the common provider decoration `options[].aside`: it becomes `description` when no description exists and is otherwise discarded.
 
 The UI fits itself to the current terminal row count. It keeps the selected option or editor visible, clips wrapped content with above/below indicators, and makes review content scrollable with Up/Down. Width and height changes invalidate the render cache and re-clamp the viewport.
 

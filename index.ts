@@ -26,6 +26,7 @@ import {
   orderedAnswers,
   orderedSkippedIds,
   reduceInteraction,
+  shouldAutoCompleteSimpleBatch,
   type InteractionQuestion,
   type InteractionState,
 } from "./interaction.ts";
@@ -168,6 +169,69 @@ type DisplayOption =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Normalizes common provider-only decoration without weakening the public schema. */
+export function normalizeAskUserArguments(args: unknown): unknown {
+  if (!isRecord(args) || !Array.isArray(args.questions)) return args;
+  let changed = false;
+  const questions = args.questions.map((question) => {
+    if (!isRecord(question) || !Array.isArray(question.options)) return question;
+    let questionChanged = false;
+    const options = question.options.map((option) => {
+      if (!isRecord(option) || !("aside" in option)) return option;
+      changed = true;
+      questionChanged = true;
+      const { aside, ...normalized } = option;
+      if (normalized.description === undefined && typeof aside === "string") {
+        normalized.description = Array.from(aside).slice(0, MAX_OPTION_DESCRIPTION_LENGTH).join("");
+      }
+      return normalized;
+    });
+    return questionChanged ? { ...question, options } : question;
+  });
+  return changed ? { ...args, questions } : args;
+}
+
+export class InteractionQueue {
+  private tail: Promise<void> = Promise.resolve();
+
+  async acquire(signal?: AbortSignal): Promise<(() => void) | undefined> {
+    let releaseSlot = (): void => {};
+    const slot = new Promise<void>((resolve) => { releaseSlot = resolve; });
+    const previous = this.tail;
+    this.tail = previous.then(() => slot);
+
+    if (signal?.aborted) {
+      releaseSlot();
+      return undefined;
+    }
+    if (signal === undefined) {
+      await previous;
+    } else {
+      let abort = (): void => {};
+      const aborted = new Promise<"aborted">((resolve) => {
+        abort = () => resolve("aborted");
+        signal.addEventListener("abort", abort, { once: true });
+      });
+      const outcome = await Promise.race([
+        previous.then(() => "ready" as const),
+        aborted,
+      ]);
+      signal.removeEventListener("abort", abort);
+      if (outcome === "aborted") {
+        releaseSlot();
+        return undefined;
+      }
+    }
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseSlot();
+    };
+  }
 }
 
 function assertKeys(value: Record<string, unknown>, allowed: string[], path: string): void {
@@ -513,6 +577,8 @@ export function renderAskUserCall(
 }
 
 export default function askUser(pi: ExtensionAPI) {
+  const interactionQueue = new InteractionQueue();
+
   pi.registerTool({
     name: "ask_user",
     label: "Ask User",
@@ -520,6 +586,9 @@ export default function askUser(pi: ExtensionAPI) {
     promptSnippet: ASK_USER_PROMPT_SNIPPET,
     promptGuidelines: ASK_USER_PROMPT_GUIDELINES,
     parameters: AskUserParams,
+    prepareArguments(args) {
+      return parseAskUserArguments(normalizeAskUserArguments(args));
+    },
 
     async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
       const params = parseAskUserArguments(rawParams);
@@ -542,7 +611,16 @@ export default function askUser(pi: ExtensionAPI) {
         if (typeof ctx.ui?.select !== "function" || typeof ctx.ui?.input !== "function") {
           return reply(buildAskUserResultMessage({ kind: "no-ui" }), [], [], "no-ui");
         }
-        const result = await runDialogInteraction(ctx.ui, params, questions, signal);
+        const release = await interactionQueue.acquire(signal);
+        if (release === undefined) {
+          return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
+        }
+        let result: InteractionResult;
+        try {
+          result = await runDialogInteraction(ctx.ui, params, questions, signal);
+        } finally {
+          release();
+        }
         const resultQuestions = params.questions.map(({ id, question, optional }) => ({ id, question, optional: optional ?? false }));
         if (result.status === "cancelled") return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
         const outcome = {
@@ -611,6 +689,24 @@ export default function askUser(pi: ExtensionAPI) {
 
           function currentQuestion(): AskUserQuestion | undefined {
             return params.questions[state.current];
+          }
+
+          function configuredSelectionWillSubmit(question: AskUserQuestion): boolean {
+            const firstOption = question.options[0];
+            if (firstOption === undefined) return false;
+            return shouldAutoCompleteSimpleBatch(questions, {
+              ...state,
+              answers: {
+                ...state.answers,
+                [question.id]: {
+                  id: question.id,
+                  question: question.question,
+                  answer: firstOption.label,
+                  wasCustom: false,
+                  index: 1,
+                },
+              },
+            });
           }
 
           function savedCustomText(question: AskUserQuestion): string {
@@ -828,11 +924,14 @@ export default function askUser(pi: ExtensionAPI) {
 
             if (editMode) addWrappedTo(footer, theme.fg("dim", "Confirm answer • Back to options"));
             else if (batched) {
+              const footerQuestion = currentQuestion();
               const instructions = state.current === questions.length
-                ? "↑/↓ scroll • Confirm • Tab/→ next • Shift+Tab/← back • Dismiss"
-                : currentQuestion()?.multiSelect
+                ? "↑/↓ scroll • Press Confirm to submit • Tab/→ next • Shift+Tab/← back • Dismiss"
+                : footerQuestion?.multiSelect
                   ? "Move • Space/number toggle • Done commits • Tab/→ next • Dismiss"
-                  : "Move or number select • Confirm • Tab/→ next • Dismiss";
+                  : footerQuestion !== undefined && configuredSelectionWillSubmit(footerQuestion)
+                    ? "Move or number select • Selecting submits • Dismiss"
+                    : "Move or number select • Confirm • Tab/→ next • Dismiss";
               addWrappedTo(footer, theme.fg("dim", instructions));
             }
             else {
@@ -882,7 +981,17 @@ export default function askUser(pi: ExtensionAPI) {
           return component;
         });
 
-      const uiExit = await Effect.runPromiseExit(Effect.tryPromise(showQuestions), signal ? { signal } : undefined);
+      const release = await interactionQueue.acquire(signal);
+      if (release === undefined) {
+        return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
+      }
+      const uiExit = await (async () => {
+        try {
+          return await Effect.runPromiseExit(Effect.tryPromise(showQuestions), signal ? { signal } : undefined);
+        } finally {
+          release();
+        }
+      })();
       if (Exit.isFailure(uiExit)) {
         if (Cause.hasInterruptsOnly(uiExit.cause)) return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
         const [first] = Cause.prettyErrors(uiExit.cause);

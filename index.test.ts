@@ -6,6 +6,7 @@ import {
   AskUserParams,
   buildAskUserDetails,
   InteractionQueue,
+  InteractionQueueRegistry,
   normalizeAskUserArguments,
   parseAskUserArguments,
   renderAskUserCall,
@@ -341,6 +342,29 @@ test("serializes interactions and lets an aborted waiter leave the queue", async
   const releaseThird = await queue.acquire();
   assert.ok(releaseThird);
   releaseThird();
+});
+
+test("isolates interaction queues by UI session", async () => {
+  const registry = new InteractionQueueRegistry();
+  const firstUi = {};
+  const secondUi = {};
+  const releaseFirst = await registry.for(firstUi).acquire();
+  assert.ok(releaseFirst);
+
+  let sameUiAcquired = false;
+  const sameUi = registry.for(firstUi).acquire().then((release) => {
+    sameUiAcquired = true;
+    return release;
+  });
+  const releaseSecondUi = await registry.for(secondUi).acquire();
+
+  assert.ok(releaseSecondUi);
+  assert.equal(sameUiAcquired, false);
+  releaseSecondUi();
+  releaseFirst();
+  const releaseSameUi = await sameUi;
+  assert.ok(releaseSameUi);
+  releaseSameUi();
 });
 
 test("dialog fallback answers single- and multi-select questions headlessly", async () => {

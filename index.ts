@@ -234,6 +234,18 @@ export class InteractionQueue {
   }
 }
 
+export class InteractionQueueRegistry {
+  private readonly queues = new WeakMap<object, InteractionQueue>();
+
+  for(owner: object): InteractionQueue {
+    const existing = this.queues.get(owner);
+    if (existing !== undefined) return existing;
+    const queue = new InteractionQueue();
+    this.queues.set(owner, queue);
+    return queue;
+  }
+}
+
 function assertKeys(value: Record<string, unknown>, allowed: string[], path: string): void {
   const extras = Object.keys(value).filter((key) => !allowed.includes(key));
   if (extras.length > 0) throw new Error(`${path} has unsupported field(s): ${extras.join(", ")}`);
@@ -577,7 +589,7 @@ export function renderAskUserCall(
 }
 
 export default function askUser(pi: ExtensionAPI) {
-  const interactionQueue = new InteractionQueue();
+  const interactionQueues = new InteractionQueueRegistry();
 
   pi.registerTool({
     name: "ask_user",
@@ -611,7 +623,7 @@ export default function askUser(pi: ExtensionAPI) {
         if (typeof ctx.ui?.select !== "function" || typeof ctx.ui?.input !== "function") {
           return reply(buildAskUserResultMessage({ kind: "no-ui" }), [], [], "no-ui");
         }
-        const release = await interactionQueue.acquire(signal);
+        const release = await interactionQueues.for(ctx.ui).acquire(signal);
         if (release === undefined) {
           return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
         }
@@ -981,7 +993,7 @@ export default function askUser(pi: ExtensionAPI) {
           return component;
         });
 
-      const release = await interactionQueue.acquire(signal);
+      const release = await interactionQueues.for(ctx.ui).acquire(signal);
       if (release === undefined) {
         return reply(buildAskUserResultMessage({ kind: "cancelled" }), [], [], "cancelled");
       }

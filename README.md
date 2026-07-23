@@ -51,7 +51,7 @@ Choose 1–10 questions based on how many independent answers are useful now. Do
 - On review, Confirm submits once all required questions are answered; otherwise it jumps to the first missing required question.
 - Cancel dismisses and returns every retained answer and explicit missing/skipped rows.
 
-Tool aborts remain `cancelled`, distinct from user dismissal, and do not imply user intent. Concurrent calls are serialized so one interaction cannot displace another. In non-TUI modes the result instructs the model to ask in plain text.
+Tool aborts remain `cancelled`, distinct from user dismissal, and do not imply user intent. Concurrent calls are serialized within each UI session so one interaction cannot displace another without blocking unrelated sessions. In non-TUI modes the result instructs the model to ask in plain text.
 
 The public schema remains strict. Before validation, the extension normalizes the common provider decoration `options[].aside`: it becomes `description` when no description exists and is otherwise discarded.
 

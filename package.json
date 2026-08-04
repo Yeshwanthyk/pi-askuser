@@ -1,6 +1,7 @@
 {
   "name": "pi-askuser",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit -p .",

@@ -456,7 +456,7 @@ test("dialog fallback answers single- and multi-select questions headlessly", as
   const result = await runDialogInteraction(ui, input, questions, undefined);
   assert.equal(result.status, "completed");
   assert.equal(result.answers.length, 2);
-  assert.deepEqual(result.answers[0], { id: "first", question: "first?", answer: "Yes", wasCustom: false, index: 0 });
+  assert.deepEqual(result.answers[0], { id: "first", question: "first?", answer: "Yes", wasCustom: false, index: 1 });
   const multi = result.answers[1];
   assert.equal(multi.multiSelect, true);
   if (multi.multiSelect === true) {
@@ -485,4 +485,120 @@ test("dialog fallback treats a cancelled dialog as dismissed with partial answer
   const result = await runDialogInteraction(ui, input, questions, undefined);
   assert.equal(result.status, "dismissed");
   assert.equal(result.answers.length, 1);
+});
+
+test("rejects invalid boolean noise instead of dropping it", () => {
+  for (const value of ["", "maybe", null, 2]) {
+    const args = { questions: [{ ...question("flags"), optional: value }] };
+    assert.equal(Check(AskUserParams, normalizeAskUserArguments(args)), false, String(value));
+    assert.throws(() => parseAskUserArguments(normalizeAskUserArguments(args)), /optional must be a boolean/);
+  }
+});
+
+test("rejects newline-bearing display fields and reserved question ids", () => {
+  const newlineCases = [
+    { question: "line\nbreak" },
+    { header: "line\nbreak" },
+    { context: "line\nbreak" },
+    { options: [{ label: "Yes", description: "line\nbreak" }, options[1]] },
+    { options: [{ label: "line\nbreak" }, options[1]] },
+  ];
+  for (const change of newlineCases) {
+    const args = { questions: [{ ...question("display"), ...change }] };
+    assert.equal(Check(AskUserParams, args), false);
+    assert.throws(() => parseAskUserArguments(args), /single line/);
+  }
+  for (const id of ["__proto__", "constructor", "toString"]) {
+    const args = { questions: [{ ...question(id) }] };
+    assert.equal(Check(AskUserParams, args), false, id);
+    assert.throws(() => parseAskUserArguments(args), /reserved/);
+  }
+});
+
+test("uses tagged choices to disambiguate labels from actions", async () => {
+  const input = parseAskUserArguments({
+    questions: [{ ...question("collision"), options: [{ label: "✏️ Other…" }, { label: "No" }] }],
+  });
+  const questions = input.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    options: q.options,
+    optional: q.optional ?? false,
+    multiSelect: q.multiSelect ?? false,
+  }));
+  const ui = {
+    select: async (_title: string, choices: string[]) => choices[0],
+    input: async () => "unused",
+  };
+  const result = await runDialogInteraction(ui, input, questions, undefined);
+  assert.equal(result.status, "completed");
+  const selected = result.answers[0];
+  assert.ok(selected !== undefined && !("selections" in selected));
+  if (selected !== undefined && !("selections" in selected)) {
+    assert.equal(selected.answer, "✏️ Other…");
+    assert.equal(selected.index, 1);
+  }
+});
+
+test("trims custom answers, ignores blanks, and keeps one multi-select custom value", async () => {
+  const input = parseAskUserArguments({
+    questions: [question("single"), { ...question("multi"), multiSelect: true }],
+  });
+  const questions = input.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    options: q.options,
+    optional: q.optional ?? false,
+    multiSelect: q.multiSelect ?? false,
+  }));
+  const inputs = ["   ", " first ", " second "];
+  let selectCount = 0;
+  const ui = {
+    select: async (_title: string, choices: string[]) => {
+      selectCount += 1;
+      if (selectCount <= 3) return "✏️ Other…";
+      return choices.find((choice) => choice.startsWith("✓ Done"));
+    },
+    input: async () => inputs.shift(),
+  };
+  const result = await runDialogInteraction(ui, input, questions, undefined);
+  assert.equal(result.status, "completed");
+  const single = result.answers[0];
+  assert.ok(single !== undefined && !("selections" in single));
+  if (single !== undefined && !("selections" in single)) assert.equal(single.answer, "first");
+  const multi = result.answers[1];
+  assert.equal(multi?.multiSelect, true);
+  if (multi?.multiSelect === true) assert.deepEqual(multi.selections, [{ answer: "second", wasCustom: true }]);
+});
+
+test("aborts while a headless select or input is pending", async () => {
+  let resolveSelect: ((value: string | undefined) => void) | undefined;
+  const selectController = new AbortController();
+  const input = parseAskUserArguments({ questions: [question("pending")] });
+  const questions = input.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    options: q.options,
+    optional: q.optional ?? false,
+    multiSelect: q.multiSelect ?? false,
+  }));
+  const pendingSelect = runDialogInteraction({
+    select: async () => new Promise<string | undefined>((resolve) => { resolveSelect = resolve; }),
+    input: async () => "unused",
+  }, input, questions, selectController.signal);
+  await Promise.resolve();
+  selectController.abort();
+  assert.equal((await pendingSelect).status, "cancelled");
+  resolveSelect?.(undefined);
+
+  let resolveInput: ((value: string | undefined) => void) | undefined;
+  const inputController = new AbortController();
+  const pendingInput = runDialogInteraction({
+    select: async () => "✏️ Other…",
+    input: async () => new Promise<string | undefined>((resolve) => { resolveInput = resolve; }),
+  }, input, questions, inputController.signal);
+  await Promise.resolve();
+  inputController.abort();
+  assert.equal((await pendingInput).status, "cancelled");
+  resolveInput?.(undefined);
 });

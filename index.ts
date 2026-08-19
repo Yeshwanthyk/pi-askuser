@@ -30,19 +30,22 @@ const MAX_OPTION_LABEL_LENGTH = 120;
 const MAX_OPTION_DESCRIPTION_LENGTH = 240;
 const MAX_CONTEXT_LENGTH = 500;
 const MAX_HEADER_LENGTH = 24;
-const NON_WHITESPACE_PATTERN = "\\S";
+const SAFE_TEXT_PATTERN = "^(?=.*\\S)[^\\r\\n]+$";
+const OPTIONAL_SINGLE_LINE_PATTERN = "^[^\\r\\n]*$";
+const SAFE_ID_PATTERN = "^(?!(?:__proto__|constructor|prototype|toString|valueOf|hasOwnProperty|isPrototypeOf|propertyIsEnumerable|toLocaleString|__defineGetter__|__defineSetter__|__lookupGetter__|__lookupSetter__)$)(?=.*\\S)[^\\r\\n]+$";
 
 const OptionSchema = Type.Object(
   {
     label: Type.String({
       minLength: 1,
       maxLength: MAX_OPTION_LABEL_LENGTH,
-      pattern: NON_WHITESPACE_PATTERN,
+      pattern: SAFE_TEXT_PATTERN,
       description: ASK_USER_PARAMETER_DESCRIPTIONS.optionLabel,
     }),
     description: Type.Optional(
       Type.String({
         maxLength: MAX_OPTION_DESCRIPTION_LENGTH,
+        pattern: OPTIONAL_SINGLE_LINE_PATTERN,
         description: ASK_USER_PARAMETER_DESCRIPTIONS.optionDescription,
       }),
     ),
@@ -54,20 +57,20 @@ const QuestionSchema = Type.Object(
   {
     id: Type.String({
       minLength: 1,
-      pattern: NON_WHITESPACE_PATTERN,
+      pattern: SAFE_ID_PATTERN,
       description: ASK_USER_PARAMETER_DESCRIPTIONS.id,
     }),
     question: Type.String({
       minLength: 1,
       maxLength: MAX_QUESTION_LENGTH,
-      pattern: NON_WHITESPACE_PATTERN,
+      pattern: SAFE_TEXT_PATTERN,
       description: ASK_USER_PARAMETER_DESCRIPTIONS.question,
     }),
     header: Type.Optional(
       Type.String({
         minLength: 1,
         maxLength: MAX_HEADER_LENGTH,
-        pattern: "^(?=.*\\S)[^\\r\\n]+$",
+        pattern: SAFE_TEXT_PATTERN,
         description: ASK_USER_PARAMETER_DESCRIPTIONS.header,
       }),
     ),
@@ -80,7 +83,7 @@ const QuestionSchema = Type.Object(
       Type.String({
         minLength: 1,
         maxLength: MAX_CONTEXT_LENGTH,
-        pattern: NON_WHITESPACE_PATTERN,
+        pattern: SAFE_TEXT_PATTERN,
         description: ASK_USER_PARAMETER_DESCRIPTIONS.context,
       }),
     ),
@@ -105,7 +108,7 @@ export const AskUserParams = Type.Object(
       Type.String({
         minLength: 1,
         maxLength: MAX_CONTEXT_LENGTH,
-        pattern: NON_WHITESPACE_PATTERN,
+        pattern: SAFE_TEXT_PATTERN,
         description: ASK_USER_PARAMETER_DESCRIPTIONS.sharedContext,
       }),
     ),
@@ -148,6 +151,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const ARGS_ALLOWED_KEYS = ["questions", "context"];
 const QUESTION_ALLOWED_KEYS = ["id", "question", "header", "options", "context", "optional", "multiSelect"];
 const OPTION_ALLOWED_KEYS = ["label", "description"];
+const RESERVED_QUESTION_IDS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "toString",
+  "valueOf",
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable",
+  "toLocaleString",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
 
 /**
  * Coerces provider-typical boolean noise ("true"/"false"/"yes"/"no"/"1"/"0")
@@ -165,7 +183,6 @@ function coerceBooleanFlag(value: unknown): boolean | undefined {
       case "false":
       case "no":
       case "0":
-      case "":
         return false;
     }
   }
@@ -216,17 +233,17 @@ function normalizeQuestionValue(question: unknown): { value: unknown; changed: b
   const context = normalizedText(question.context, Object.prototype.hasOwnProperty.call(question, "context"));
   if (header.changed || context.changed) changed = true;
 
-  let optional: boolean | undefined;
+  let optional: unknown;
   if (Object.prototype.hasOwnProperty.call(question, "optional")) {
     const coerced = coerceBooleanFlag(question.optional);
-    optional = coerced;
-    if (coerced !== question.optional) changed = true;
+    optional = coerced === undefined ? question.optional : coerced;
+    if (coerced !== undefined && coerced !== question.optional) changed = true;
   }
-  let multiSelect: boolean | undefined;
+  let multiSelect: unknown;
   if (Object.prototype.hasOwnProperty.call(question, "multiSelect")) {
     const coerced = coerceBooleanFlag(question.multiSelect);
-    multiSelect = coerced;
-    if (coerced !== question.multiSelect) changed = true;
+    multiSelect = coerced === undefined ? question.multiSelect : coerced;
+    if (coerced !== undefined && coerced !== question.multiSelect) changed = true;
   }
 
   let options = question.options;
@@ -340,6 +357,9 @@ function parseNonEmptyString(value: unknown, path: string, maxLength?: number): 
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new Error(`${path} must be a non-empty string`);
   }
+  if (value.includes("\n") || value.includes("\r")) {
+    throw new Error(`${path} must be a single line`);
+  }
   if (maxLength !== undefined && Array.from(value).length > maxLength) {
     throw new Error(`${path} must be at most ${maxLength} characters`);
   }
@@ -372,11 +392,13 @@ function parseOptions(value: unknown, path: string): AskUserOption[] {
     if (option.description !== undefined && typeof option.description !== "string") {
       throw new Error(`${optionPath}.description must be a string`);
     }
-    if (
-      typeof option.description === "string" &&
-      Array.from(option.description).length > MAX_OPTION_DESCRIPTION_LENGTH
-    ) {
-      throw new Error(`${optionPath}.description must be at most ${MAX_OPTION_DESCRIPTION_LENGTH} characters`);
+    if (typeof option.description === "string") {
+      if (option.description.includes("\n") || option.description.includes("\r")) {
+        throw new Error(`${optionPath}.description must be a single line`);
+      }
+      if (Array.from(option.description).length > MAX_OPTION_DESCRIPTION_LENGTH) {
+        throw new Error(`${optionPath}.description must be at most ${MAX_OPTION_DESCRIPTION_LENGTH} characters`);
+      }
     }
     return option.description === undefined ? { label } : { label, description: option.description };
   });
@@ -387,6 +409,9 @@ function parseQuestion(value: unknown, index: number): AskUserQuestion {
   if (!isRecord(value)) throw new Error(`${path} must be an object`);
   assertKeys(value, ["id", "question", "header", "options", "context", "optional", "multiSelect"], path);
   const id = parseNonEmptyString(value.id, `${path}.id`);
+  if (RESERVED_QUESTION_IDS.has(id)) {
+    throw new Error(`${path}.id is reserved for interaction state`);
+  }
   const question = parseNonEmptyString(value.question, `${path}.question`, MAX_QUESTION_LENGTH);
   const header = parseHeader(value.header, `${path}.header`);
   const options = parseOptions(value.options, `${path}.options`);
@@ -462,6 +487,63 @@ function choiceLabel(option: { label: string; description?: string }): string {
   return option.description ? `${option.label} — ${option.description}` : option.label;
 }
 
+type DialogChoice =
+  | { kind: "configured"; label: string; optionIndex: number }
+  | { kind: "other" | "done" | "skip" | "custom"; label: string };
+
+type PresentedDialogChoice = DialogChoice & { value: string };
+
+const CHOICE_TAG = "\u2063";
+
+/** Keep the ordinary labels readable while tagging ambiguous rows. */
+function presentDialogChoices(choices: DialogChoice[]): PresentedDialogChoice[] {
+  const counts = new Map<string, number>();
+  for (const choice of choices) counts.set(choice.label, (counts.get(choice.label) ?? 0) + 1);
+  return choices.map((choice, index) => ({
+    ...choice,
+    value: (counts.get(choice.label) ?? 0) > 1 ? `${choice.label}${CHOICE_TAG}${index}` : choice.label,
+  }));
+}
+
+function resolveDialogChoice(picked: string, choices: PresentedDialogChoice[]): PresentedDialogChoice | undefined {
+  const exact = choices.find((choice) => choice.value === picked);
+  if (exact !== undefined) return exact;
+  const raw = choices.filter((choice) => choice.label === picked);
+  return raw.length === 1 ? raw[0] : undefined;
+}
+
+type PendingDialogResult<T> = { kind: "value"; value: T } | { kind: "aborted" };
+
+function pendingDialog<T>(operation: () => Promise<T>, signal: AbortSignal | undefined): Promise<PendingDialogResult<T>> {
+  if (signal === undefined) return operation().then((value) => ({ kind: "value", value }));
+  if (signal.aborted) return Promise.resolve({ kind: "aborted" });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ kind: "aborted" });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve().then(operation).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ kind: "value", value });
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 export async function runDialogInteraction(
   ui: DialogUI,
   input: AskUserInput,
@@ -470,38 +552,49 @@ export async function runDialogInteraction(
 ): Promise<InteractionResult> {
   const answers: AskUserAnswer[] = [];
   const skippedOptionalQuestionIds: string[] = [];
+  const cancelled = (): InteractionResult => ({ answers: [], skippedOptionalQuestionIds: [], status: "cancelled" });
   const dismissed = (): InteractionResult => ({ answers, skippedOptionalQuestionIds, status: "dismissed" });
 
   if (input.context) ui.notify?.(input.context, "info");
 
   for (const [index, question] of questions.entries()) {
-    if (signal?.aborted) return { answers: [], skippedOptionalQuestionIds: [], status: "cancelled" };
+    if (signal?.aborted) return cancelled();
     const source = input.questions[index];
     const labels = source.options.map(choiceLabel);
     const title = source.context ? `${question.question} (${source.context})` : question.question;
 
     if (!question.multiSelect) {
-      const choices = [...labels, OTHER_CHOICE, ...(question.optional ? [SKIP_CHOICE] : [])];
       let resolved = false;
       while (!resolved) {
-        const picked = await ui.select(title, choices);
-        if (picked === undefined) return dismissed();
-        if (picked === SKIP_CHOICE) {
+        if (signal?.aborted) return cancelled();
+        const choices = presentDialogChoices([
+          ...labels.map((label, optionIndex) => ({ kind: "configured" as const, label, optionIndex })),
+          { kind: "other", label: OTHER_CHOICE },
+          ...(question.optional ? [{ kind: "skip" as const, label: SKIP_CHOICE }] : []),
+        ]);
+        const pending = await pendingDialog(() => ui.select(title, choices.map((choice) => choice.value)), signal);
+        if (pending.kind === "aborted") return cancelled();
+        if (pending.value === undefined) return dismissed();
+        const picked = resolveDialogChoice(pending.value, choices);
+        if (picked === undefined) continue;
+        if (picked.kind === "skip") {
           skippedOptionalQuestionIds.push(question.id);
           resolved = true;
-        } else if (picked === OTHER_CHOICE) {
-          const custom = await ui.input(title, "Type your answer");
-          if (custom === undefined) continue; // back to the options
+        } else if (picked.kind === "other") {
+          const pendingInput = await pendingDialog(() => ui.input(title, "Type your answer"), signal);
+          if (pendingInput.kind === "aborted") return cancelled();
+          if (pendingInput.value === undefined) continue;
+          const custom = pendingInput.value.trim();
+          if (custom.length === 0 || custom.includes("\n") || custom.includes("\r")) continue;
           answers.push({ id: question.id, question: question.question, answer: custom, wasCustom: true });
           resolved = true;
-        } else {
-          const optionIndex = choices.indexOf(picked);
+        } else if (picked.kind === "configured") {
           answers.push({
             id: question.id,
             question: question.question,
-            answer: source.options[optionIndex]?.label ?? picked,
+            answer: source.options[picked.optionIndex].label,
             wasCustom: false,
-            index: optionIndex,
+            index: picked.optionIndex + 1,
           });
           resolved = true;
         }
@@ -510,29 +603,45 @@ export async function runDialogInteraction(
     }
 
     const selectedIndices = new Set<number>();
-    const customTexts: string[] = [];
+    let customText: string | undefined;
     let done = false;
     while (!done) {
-      const choices = [
-        ...labels.map((label, i) => `${selectedIndices.has(i) ? "[x]" : "[ ]"} ${label}`),
-        ...customTexts.map((text) => `[x] ${text}`),
-        OTHER_CHOICE,
-        DONE_CHOICE,
-        ...(question.optional ? [SKIP_CHOICE] : []),
-      ];
-      const picked = await ui.select(`${title} (select all that apply)`, choices);
-      if (picked === undefined) return dismissed();
-      if (picked === SKIP_CHOICE) {
+      if (signal?.aborted) return cancelled();
+      const choices = presentDialogChoices([
+        ...labels.map((label, optionIndex) => ({
+          kind: "configured" as const,
+          label: `${selectedIndices.has(optionIndex) ? "[x]" : "[ ]"} ${label}`,
+          optionIndex,
+        })),
+        ...(customText === undefined ? [] : [{ kind: "custom" as const, label: `[x] ${customText}` }]),
+        { kind: "other", label: OTHER_CHOICE },
+        { kind: "done", label: DONE_CHOICE },
+        ...(question.optional ? [{ kind: "skip" as const, label: SKIP_CHOICE }] : []),
+      ]);
+      const pending = await pendingDialog(
+        () => ui.select(`${title} (select all that apply)`, choices.map((choice) => choice.value)),
+        signal,
+      );
+      if (pending.kind === "aborted") return cancelled();
+      if (pending.value === undefined) return dismissed();
+      const picked = resolveDialogChoice(pending.value, choices);
+      if (picked === undefined) continue;
+      if (picked.kind === "skip") {
         skippedOptionalQuestionIds.push(question.id);
         done = true;
-      } else if (picked === OTHER_CHOICE) {
-        const custom = await ui.input(title, "Type your answer");
-        if (custom !== undefined) customTexts.push(custom);
-      } else if (picked === DONE_CHOICE) {
-        if (selectedIndices.size === 0 && customTexts.length === 0) {
-          if (question.optional) {
-            skippedOptionalQuestionIds.push(question.id);
-          } else {
+      } else if (picked.kind === "other") {
+        const pendingInput = await pendingDialog(() => ui.input(title, "Type your answer"), signal);
+        if (pendingInput.kind === "aborted") return cancelled();
+        if (pendingInput.value !== undefined) {
+          const custom = pendingInput.value.trim();
+          if (custom.length > 0 && !custom.includes("\n") && !custom.includes("\r")) customText = custom;
+        }
+      } else if (picked.kind === "custom") {
+        customText = undefined;
+      } else if (picked.kind === "done") {
+        if (selectedIndices.size === 0 && customText === undefined) {
+          if (question.optional) skippedOptionalQuestionIds.push(question.id);
+          else {
             ui.notify?.("Select at least one option", "warning");
             continue;
           }
@@ -541,22 +650,17 @@ export async function runDialogInteraction(
             ...[...selectedIndices].sort((a, b) => a - b).map((i) => ({
               answer: source.options[i].label,
               wasCustom: false,
-              index: i,
+              index: i + 1,
             })),
-            ...customTexts.map((text) => ({ answer: text, wasCustom: true })),
+            ...(customText === undefined ? [] : [{ answer: customText, wasCustom: true }]),
           ];
           answers.push({ id: question.id, question: question.question, multiSelect: true, selections });
         }
         done = true;
-      } else {
-        const choiceIndex = choices.indexOf(picked);
-        if (choiceIndex >= 0 && choiceIndex < labels.length) {
-          if (selectedIndices.has(choiceIndex)) selectedIndices.delete(choiceIndex);
-          else selectedIndices.add(choiceIndex);
-        } else {
-          const customIndex = choiceIndex - labels.length;
-          if (customIndex >= 0 && customIndex < customTexts.length) customTexts.splice(customIndex, 1);
-        }
+      } else if (picked.kind === "configured" && selectedIndices.has(picked.optionIndex)) {
+        selectedIndices.delete(picked.optionIndex);
+      } else if (picked.kind === "configured") {
+        selectedIndices.add(picked.optionIndex);
       }
     }
   }

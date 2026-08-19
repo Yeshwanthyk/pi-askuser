@@ -249,7 +249,7 @@ test("opencode-go/deepseek-v4-flash fake endpoint survives the full ask_user pip
       answers,
       skippedOptionalQuestionIds: [],
     });
-    assert.match(message, /user selected option 0: Node/);
+    assert.match(message, /user selected option 1: Node/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

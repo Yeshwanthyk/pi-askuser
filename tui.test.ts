@@ -222,12 +222,13 @@ test("keeps every rendered line safe across narrow widths and terminal heights",
 
   for (const rows of [0, 1, 2, 4, 8, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
     terminal.rows = rows;
-    for (const width of [0, 1, 2, 8, 40]) {
+    for (const width of [0, 1, 2, 8, 40, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
       assert.doesNotThrow(() => {
         const lines = component.render(width);
         const expectedRows = Number.isFinite(rows) ? Math.max(0, Math.floor(rows)) : 0;
         assert.ok(lines.length <= expectedRows);
-        assert.ok(lines.every((line) => visibleWidth(line) <= Math.max(1, width)));
+        const expectedWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+        assert.ok(lines.every((line) => visibleWidth(line) <= expectedWidth));
       }, `rows=${rows}, width=${width}`);
     }
   }

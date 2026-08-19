@@ -32,7 +32,7 @@ Choose 1–10 questions based on how many independent answers are useful now. Do
 
 ## Keyboard flow
 
-### One question
+### Keyboard behavior
 The inline footer names the active configured movement, confirm, and dismiss keys. Batched questions also expose `Tab` / `→` and `Shift+Tab` / `←`; the inline editor exposes `Enter` to save and `Esc` to cancel.
 
 ### One question

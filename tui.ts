@@ -328,7 +328,7 @@ export function createAskUserTui({
   function render(width: number): string[] {
     const height = Math.max(0, tui.terminal.rows);
     if (cachedLines && cachedWidth === width && cachedHeight === height) return cachedLines;
-    const renderWidth = Math.max(1, width);
+    const renderWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
     const header: string[] = [];
     const body: string[] = [];
     const footer: string[] = [];

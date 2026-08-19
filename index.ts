@@ -2,33 +2,13 @@
 
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import {
-  CURSOR_MARKER,
-  Editor,
-  type EditorTheme,
-  type Focusable,
-  Key,
-  matchesKey,
   Text,
-  truncateToWidth,
-  visibleWidth,
-  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Cause, Effect, Exit } from "effect";
 import { Type, type Static } from "typebox";
 import {
   type AskUserAnswer,
-  createInteractionState,
-  customTextFor,
-  draftFor,
-  findNextUnresolvedIndex,
-  firstMissingRequiredIndex,
-  isOptionSelected,
-  orderedAnswers,
-  orderedSkippedIds,
-  reduceInteraction,
-  shouldAutoCompleteSimpleBatch,
   type InteractionQuestion,
-  type InteractionState,
 } from "./interaction.ts";
 import {
   ASK_USER_PARAMETER_DESCRIPTIONS,
@@ -37,7 +17,7 @@ import {
   ASK_USER_TOOL_DESCRIPTION,
   buildAskUserResultMessage,
 } from "./prompt.ts";
-import { fitViewport, type LineRange, markerLineRange } from "./viewport.ts";
+import { createAskUserTui } from "./tui.ts";
 
 export type { AskUserAnswer, AskUserSelection } from "./interaction.ts";
 
@@ -160,12 +140,6 @@ interface InteractionResult {
   skippedOptionalQuestionIds: string[];
   status: "completed" | "dismissed" | "cancelled";
 }
-
-type DisplayOption =
-  | (AskUserOption & { kind: "answer"; configuredIndex: number })
-  | { label: string; kind: "other" }
-  | { label: string; kind: "done" }
-  | { label: string; kind: "skip" };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -655,15 +629,6 @@ function isAskUserDetails(value: unknown): value is AskUserDetails {
   );
 }
 
-function displayOptions(question: AskUserQuestion): DisplayOption[] {
-  return [
-    ...question.options.map((option, configuredIndex) => ({ ...option, kind: "answer" as const, configuredIndex })),
-    { label: "Write my own answer…", kind: "other" },
-    ...(question.multiSelect ? [{ label: "Done selecting", kind: "done" as const }] : []),
-    ...(question.optional ? [{ label: "Skip this question", kind: "skip" as const }] : []),
-  ];
-}
-
 function answerText(answer: AskUserAnswer): string {
   if (answer.multiSelect === true) {
     return answer.selections
@@ -756,353 +721,24 @@ export default function askUser(pi: ExtensionAPI) {
       }
 
       const showQuestions = (uiSignal: AbortSignal) =>
-        ctx.ui.custom<InteractionResult>((tui, theme, keybindings, done) => {
-          const batched = questions.length > 1;
-          let state = createInteractionState();
-          let editMode = false;
-          let componentFocused = false;
-          let reviewOffset = 0;
-          let cachedWidth: number | undefined;
-          let cachedHeight: number | undefined;
-          let cachedLines: string[] | undefined;
-          let settled = false;
-
-          const editorTheme: EditorTheme = {
-            borderColor: (text) => theme.fg("accent", text),
-            selectList: {
-              selectedPrefix: (text) => theme.fg("accent", text),
-              selectedText: (text) => theme.fg("accent", text),
-              description: (text) => theme.fg("muted", text),
-              scrollInfo: (text) => theme.fg("dim", text),
-              noMatch: (text) => theme.fg("warning", text),
+        ctx.ui.custom<InteractionResult>((tui, theme, keybindings, done) =>
+          createAskUserTui({
+            params: {
+              ...(params.context === undefined ? {} : { context: params.context }),
+              questions: params.questions.map((question) => ({
+                ...question,
+                optional: question.optional ?? false,
+                multiSelect: question.multiSelect ?? false,
+              })),
             },
-          };
-          const editor = new Editor(tui, editorTheme);
-
-          function finishFromState(): void {
-            if (settled || state.status === "active") return;
-            settled = true;
-            uiSignal.removeEventListener("abort", abort);
-            done({
-              answers: state.status === "cancelled" ? [] : orderedAnswers(questions, state),
-              skippedOptionalQuestionIds: state.status === "cancelled" ? [] : orderedSkippedIds(questions, state),
-              status: state.status,
-            });
-          }
-
-          function dispatch(action: Parameters<typeof reduceInteraction>[2]): void {
-            state = reduceInteraction(questions, state, action);
-            refresh();
-            finishFromState();
-          }
-
-          function abort(): void { dispatch({ type: "cancel" }); }
-
-          function refresh(): void {
-            cachedWidth = undefined;
-            cachedHeight = undefined;
-            cachedLines = undefined;
-            tui.requestRender();
-          }
-
-          function setEditMode(value: boolean): void {
-            editMode = value;
-            editor.focused = componentFocused && value;
-          }
-
-          function currentQuestion(): AskUserQuestion | undefined {
-            return params.questions[state.current];
-          }
-
-          function configuredSelectionWillSubmit(question: AskUserQuestion): boolean {
-            const firstOption = question.options[0];
-            if (firstOption === undefined) return false;
-            return shouldAutoCompleteSimpleBatch(questions, {
-              ...state,
-              answers: {
-                ...state.answers,
-                [question.id]: {
-                  id: question.id,
-                  question: question.question,
-                  answer: firstOption.label,
-                  wasCustom: false,
-                  index: 1,
-                },
-              },
-            });
-          }
-
-          function savedCustomText(question: AskUserQuestion): string {
-            const draftText = customTextFor(state, question.id);
-            if (draftText.length > 0) return draftText;
-            const answer = state.answers[question.id];
-            return answer !== undefined && answer.multiSelect !== true && answer.wasCustom
-              ? answer.answer
-              : "";
-          }
-
-          function goTo(index: number): void {
-            dispatch({ type: "navigate", index: (index + questions.length + 1) % (questions.length + 1) });
-            setEditMode(false);
-            const question = currentQuestion();
-            editor.setText(question ? savedCustomText(question) : "");
-            reviewOffset = 0;
-          }
-
-          function setCursor(question: AskUserQuestion, index: number): void {
-            const options = displayOptions(question);
-            const current = state.optionIndices[question.id] ?? 0;
-            dispatch({ type: "moveCursor", delta: index - current, optionCount: options.length });
-          }
-
-          function openEditor(question: AskUserQuestion, index: number): void {
-            setCursor(question, index);
-            editor.setText(savedCustomText(question));
-            setEditMode(true);
-            refresh();
-          }
-
-          function activate(index: number): void {
-            const question = currentQuestion();
-            if (!question) return;
-            const option = displayOptions(question)[index];
-            if (!option) return;
-            setCursor(question, index);
-            if (option.kind === "other") openEditor(question, index);
-            else if (option.kind === "skip") dispatch({ type: "skip" });
-            else if (option.kind === "done") dispatch({ type: "commitMulti" });
-            else dispatch({ type: "selectOption", optionIndex: option.configuredIndex });
-          }
-
-          editor.onSubmit = (value) => {
-            const question = currentQuestion();
-            if (!question) return;
-            const trimmed = value.trim();
-            setEditMode(false);
-            if (question.multiSelect && trimmed.length === 0) dispatch({ type: "removeCustom" });
-            else if (trimmed.length > 0) dispatch({ type: "submitCustom", text: trimmed });
-            else refresh();
-          };
-
-          function handleInput(data: string): void {
-            if (editMode) {
-              if (keybindings.matches(data, "tui.select.cancel")) {
-                const question = currentQuestion();
-                setEditMode(false);
-                editor.setText(question ? savedCustomText(question) : "");
-                refresh();
-              } else {
-                editor.handleInput(data);
-                refresh();
-              }
-              return;
-            }
-
-            if (batched && (matchesKey(data, Key.tab) || matchesKey(data, Key.right))) {
-              goTo(state.current + 1);
-              return;
-            }
-            if (batched && (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left))) {
-              goTo(state.current - 1);
-              return;
-            }
-
-            if (state.current === questions.length) {
-              if (keybindings.matches(data, "tui.select.up")) {
-                reviewOffset = Math.max(0, reviewOffset - 1);
-                refresh();
-              } else if (keybindings.matches(data, "tui.select.down")) {
-                reviewOffset += 1;
-                refresh();
-              } else if (keybindings.matches(data, "tui.select.confirm")) {
-                const missing = firstMissingRequiredIndex(questions, state);
-                if (missing === undefined) dispatch({ type: "complete" });
-                else goTo(missing);
-              } else if (keybindings.matches(data, "tui.select.cancel")) dispatch({ type: "dismiss" });
-              return;
-            }
-
-            const question = currentQuestion();
-            if (!question) return;
-            const options = displayOptions(question);
-            const selected = state.optionIndices[question.id] ?? 0;
-            if (keybindings.matches(data, "tui.select.up")) dispatch({ type: "moveCursor", delta: -1, optionCount: options.length });
-            else if (keybindings.matches(data, "tui.select.down")) dispatch({ type: "moveCursor", delta: 1, optionCount: options.length });
-            else if (data.length === 1 && data >= "1" && Number(data) <= question.options.length) activate(Number(data) - 1);
-            else if (question.multiSelect && matchesKey(data, Key.space)) activate(selected);
-            else if (keybindings.matches(data, "tui.select.confirm")) activate(selected);
-            else if (keybindings.matches(data, "tui.select.cancel")) dispatch({ type: "dismiss" });
-          }
-
-          function render(width: number): string[] {
-            const height = Math.max(0, tui.terminal.rows);
-            if (cachedLines && cachedWidth === width && cachedHeight === height) return cachedLines;
-            const renderWidth = Math.max(1, width);
-            const header: string[] = [];
-            const body: string[] = [];
-            const footer: string[] = [];
-            let anchor: LineRange | undefined;
-            const addTo = (target: string[], text: string) => target.push(truncateToWidth(text, renderWidth));
-            const addWrappedTo = (target: string[], text: string, prefix = " ") => {
-              const prefixWidth = visibleWidth(prefix);
-              const wrapped = wrapTextWithAnsi(text, Math.max(1, renderWidth - prefixWidth));
-              const continuation = " ".repeat(prefixWidth);
-              if (wrapped.length === 0) addTo(target, prefix);
-              for (let index = 0; index < wrapped.length; index++) {
-                addTo(target, `${index === 0 ? prefix : continuation}${wrapped[index]}`);
-              }
-            };
-            const addContext = (text: string) => {
-              addWrappedTo(body, theme.fg("muted", text));
-              body.push("");
-            };
-
-            const activeQuestion = currentQuestion();
-            const titleText = activeQuestion?.header ?? (batched ? "Questions" : "Question");
-            const title = ` ${titleText} `;
-            addTo(header, theme.fg("accent", `─${title}${"─".repeat(Math.max(0, renderWidth - visibleWidth(title) - 1))}`));
-            if (params.context) addContext(params.context);
-            if (batched) {
-              const position = state.current === questions.length ? "Review" : `${state.current + 1}/${questions.length}`;
-              addWrappedTo(header, theme.fg("dim", `${position} • ${Object.keys(state.answers).length} answered${state.skippedIds.length > 0 ? ` • ${state.skippedIds.length} skipped` : ""}`));
-            }
-
-            if (state.current === questions.length) {
-              addWrappedTo(body, theme.fg("text", theme.bold("Review answers")));
-              body.push("");
-              for (let index = 0; index < params.questions.length; index++) {
-                const question = params.questions[index];
-                if (!question) continue;
-                const answer = state.answers[question.id];
-                const skipped = state.skippedIds.includes(question.id);
-                const value = answer ? answerText(answer) : skipped ? "skipped (optional)" : question.optional ? "not answered (optional)" : "missing (required)";
-                const compact = question.header ?? question.question;
-                addWrappedTo(body, `${theme.fg("text", `${index + 1}. ${compact}`)}${question.optional ? theme.fg("dim", " (optional)") : ""} ${theme.fg("dim", `[${question.id}]`)} — ${theme.fg(answer || skipped || question.optional ? "text" : "warning", value)}`);
-              }
-              body.push("");
-              const missing = firstMissingRequiredIndex(questions, state);
-              addWrappedTo(body, theme.fg(missing === undefined ? "success" : "warning", missing === undefined ? "Confirm to submit" : "Confirm to answer the first missing required question"));
-            } else {
-              const question = currentQuestion();
-              if (question) {
-                if (question.context) addContext(question.context);
-                addWrappedTo(body, theme.fg("text", theme.bold(question.question)) + (question.optional ? theme.fg("dim", " (optional)") : ""));
-                body.push("");
-                const options = displayOptions(question);
-                for (let index = 0; index < options.length; index++) {
-                  const option = options[index];
-                  if (!option) continue;
-                  const rowStart = body.length;
-                  const selected = index === (state.optionIndices[question.id] ?? 0);
-                  const prefix = selected ? theme.fg("accent", " ❯ ") : "   ";
-                  const draft = draftFor(state, question.id);
-                  const savedAnswer = state.answers[question.id];
-                  const customSelected = option.kind === "other" && (
-                    question.multiSelect
-                      ? draft.customText !== undefined
-                      : savedAnswer !== undefined && savedAnswer.multiSelect !== true && savedAnswer.wasCustom
-                  );
-                  const configuredSelected = option.kind === "answer" && (
-                    question.multiSelect
-                      ? isOptionSelected(state, question.id, option.configuredIndex)
-                      : savedAnswer !== undefined && savedAnswer.multiSelect !== true && !savedAnswer.wasCustom && savedAnswer.index === option.configuredIndex + 1
-                  );
-                  const savedSelection = option.kind === "answer"
-                    ? savedAnswer?.multiSelect === true
-                      ? savedAnswer.selections.some((selection) => !selection.wasCustom && selection.index === option.configuredIndex + 1)
-                      : configuredSelected
-                    : option.kind === "other"
-                      ? savedAnswer?.multiSelect === true
-                        ? savedAnswer.selections.some((selection) => selection.wasCustom)
-                        : customSelected
-                      : false;
-                  let marker: string;
-                  if (question.multiSelect) {
-                    if (option.kind === "answer") marker = configuredSelected ? "[x]" : "[ ]";
-                    else if (option.kind === "other") marker = customSelected ? "[x]" : "[ ]";
-                    else marker = option.kind === "done" ? "✓" : "○";
-                  } else if (option.kind === "answer") marker = `${option.configuredIndex + 1}.`;
-                  else marker = option.kind === "other" ? "✎" : "○";
-                  const color = selected || (option.kind === "other" && editMode) ? "accent" : option.kind === "answer" ? "text" : "muted";
-                  const stored = savedSelection
-                    ? theme.fg("success", "  ✓ saved")
-                    : option.kind === "skip" && state.skippedIds.includes(question.id) ? theme.fg("success", "  ✓ skipped") : "";
-                  addWrappedTo(body, `${theme.fg(color, `${marker} ${option.label}`)}${stored}`, prefix);
-                  if (option.kind === "answer" && option.description) {
-                    addWrappedTo(body, theme.fg("muted", option.description), "      ");
-                  }
-                  if (selected) anchor = { start: rowStart, end: body.length };
-                }
-                if (editMode) {
-                  const rowStart = body.length;
-                  body.push("");
-                  addTo(body, theme.fg("muted", " Your answer:"));
-                  const editorLines = editor.render(Math.max(1, renderWidth - 2));
-                  const cursorAnchor = markerLineRange(editorLines, CURSOR_MARKER, body.length);
-                  for (const line of editorLines) addTo(body, ` ${line}`);
-                  anchor = cursorAnchor ?? { start: rowStart, end: body.length };
-                }
-              }
-            }
-
-            if (editMode) addWrappedTo(footer, theme.fg("dim", "Confirm answer • Back to options"));
-            else if (batched) {
-              const footerQuestion = currentQuestion();
-              const instructions = state.current === questions.length
-                ? "↑/↓ scroll • Press Confirm to submit • Tab/→ next • Shift+Tab/← back • Dismiss"
-                : footerQuestion?.multiSelect
-                  ? "Move • Space/number toggle • Done commits • Tab/→ next • Dismiss"
-                  : footerQuestion !== undefined && configuredSelectionWillSubmit(footerQuestion)
-                    ? "Move or number select • Selecting submits • Dismiss"
-                    : "Move or number select • Confirm • Tab/→ next • Dismiss";
-              addWrappedTo(footer, theme.fg("dim", instructions));
-            }
-            else {
-              const question = params.questions[0];
-              addWrappedTo(footer, theme.fg("dim", question?.multiSelect ? "Move • Space/number toggle • Confirm/Done • Dismiss" : "Move or number select • Confirm • Dismiss"));
-            }
-            addTo(footer, theme.fg("accent", "─".repeat(renderWidth)));
-
-            const viewport = fitViewport({
-              rows: height,
-              header,
-              body,
-              footer,
-              anchor,
-              ...(state.current === questions.length ? { offset: reviewOffset } : {}),
-            });
-            if (state.current === questions.length) reviewOffset = viewport.bodyStart;
-            cachedWidth = width;
-            cachedHeight = height;
-            cachedLines = viewport.lines.map((line) => truncateToWidth(line, renderWidth));
-            return cachedLines;
-          }
-
-          uiSignal.addEventListener("abort", abort, { once: true });
-          if (uiSignal.aborted) queueMicrotask(abort);
-          const component: Focusable & {
-            render: (width: number) => string[];
-            invalidate: () => void;
-            handleInput: (data: string) => void;
-            dispose: () => void;
-          } = {
-            get focused() { return componentFocused; },
-            set focused(value: boolean) {
-              componentFocused = value;
-              editor.focused = value && editMode;
-            },
-            render,
-            invalidate: () => {
-              cachedWidth = undefined;
-              cachedHeight = undefined;
-              cachedLines = undefined;
-              editor.invalidate();
-            },
-            handleInput,
-            dispose: () => uiSignal.removeEventListener("abort", abort),
-          };
-          return component;
-        });
+            questions,
+            tui,
+            theme,
+            keybindings,
+            signal: uiSignal,
+            done,
+          }),
+        );
 
       const release = await interactionQueues.for(ctx.ui).acquire(signal);
       if (release === undefined) {
@@ -1148,7 +784,7 @@ export default function askUser(pi: ExtensionAPI) {
       const skippedIds = new Set(details.skippedOptionalQuestionIds);
       const rows = details.questions.map((question) => {
         const answer = details.answers.find((candidate) => candidate.id === question.id);
-        const label = `${theme.fg("text", question.header ?? question.question)}${question.optional ? theme.fg("dim", " (optional)") : ""} ${theme.fg("dim", `[${question.id}]`)}`;
+        const label = `${theme.fg("text", question.header ?? question.question)}${question.optional ? theme.fg("dim", " (optional)") : ""}`;
         if (!answer) {
           const value = question.optional ? skippedIds.has(question.id) ? "skipped (optional)" : "not answered (optional)" : "not answered (required)";
           return `${theme.fg(question.optional ? "muted" : "warning", "○ ")}${label}: ${value}`;

@@ -33,6 +33,9 @@ Choose 1–10 questions based on how many independent answers are useful now. Do
 ## Keyboard flow
 
 ### One question
+The inline footer names the active configured movement, confirm, and dismiss keys. Batched questions also expose `Tab` / `→` and `Shift+Tab` / `←`; the inline editor exposes `Enter` to save and `Esc` to cancel.
+
+### One question
 
 - Configured selection up/down bindings move through options.
 - For single-select questions, number keys choose immediately and Confirm submits the selected answer immediately; there is no review step.

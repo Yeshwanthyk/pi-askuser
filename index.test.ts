@@ -84,6 +84,66 @@ test("normalizes Opus decoration while leaving valid Sol arguments unchanged", (
   assert.equal(Check(AskUserParams, normalized), true);
 });
 
+test("normalizes DeepSeek-style noise into valid canonical arguments", () => {
+  const noisy = {
+    sharedContext: "Ignore me", // unknown top-level key
+    questions: [{
+      id: "deploy",
+      question: "Deploy now?",
+      header: null,
+      context: "   ",
+      optional: "false",
+      multiSelect: 0,
+      type: "choice", // unknown question keys
+      required: true,
+      options: [
+        { label: "Yes", checked: false, priority: 1 },
+        { label: "No", aside: "Not yet", selected: true },
+        { label: "Maybe", description: null },
+      ],
+    }],
+  };
+  assert.equal(Check(AskUserParams, noisy), false);
+  const normalized = normalizeAskUserArguments(noisy);
+  assert.equal(Check(AskUserParams, normalized), true);
+  assert.deepEqual(normalized, {
+    questions: [{
+      id: "deploy",
+      question: "Deploy now?",
+      optional: false,
+      multiSelect: false,
+      options: [
+        { label: "Yes" },
+        { label: "No", description: "Not yet" },
+        { label: "Maybe" },
+      ],
+    }],
+  });
+  // The strict parse accepts the normalized shape end to end.
+  const parsed = parseAskUserArguments(normalized);
+  assert.equal(parsed.questions.length, 1);
+  assert.equal(parsed.questions[0]?.optional, false);
+});
+
+test("normalization leaves genuinely broken arguments broken", () => {
+  assert.throws(() => parseAskUserArguments(normalizeAskUserArguments({ questions: [] })));
+  assert.throws(() =>
+    parseAskUserArguments(normalizeAskUserArguments({
+      questions: [{ ...question("x"), options: [{ label: "only one" }] }],
+    })),
+  );
+  assert.throws(() =>
+    parseAskUserArguments(normalizeAskUserArguments({
+      questions: [{ id: "x", question: "q?", options: "not-an-array" }],
+    })),
+  );
+  // Non-object question entries leave the input untouched so the strict parse
+  // reports a real error instead of silently swallowing it.
+  const broken = { questions: [42] };
+  assert.strictEqual(normalizeAskUserArguments(broken), broken);
+  assert.throws(() => parseAskUserArguments(broken));
+});
+
 test("accepts only the strict current input shape", () => {
   const input = {
     context: "Choose deployment defaults.",

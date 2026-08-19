@@ -171,26 +171,137 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Normalizes common provider-only decoration without weakening the public schema. */
+const ARGS_ALLOWED_KEYS = ["questions", "context"];
+const QUESTION_ALLOWED_KEYS = ["id", "question", "header", "options", "context", "optional", "multiSelect"];
+const OPTION_ALLOWED_KEYS = ["label", "description"];
+
+/**
+ * Coerces provider-typical boolean noise ("true"/"false"/"yes"/"no"/"1"/"0")
+ * to real booleans. Returns undefined when the value cannot be interpreted.
+ */
+function coerceBooleanFlag(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && (value === 0 || value === 1)) return value === 1;
+  if (typeof value === "string") {
+    switch (value.trim().toLowerCase()) {
+      case "true":
+      case "yes":
+      case "1":
+        return true;
+      case "false":
+      case "no":
+      case "0":
+      case "":
+        return false;
+    }
+  }
+  return undefined;
+}
+
+function normalizedText(value: unknown, present: boolean): { value: unknown; changed: boolean } {
+  if (!present) return { value: undefined, changed: false };
+  if (typeof value === "string" && value.trim().length > 0) return { value, changed: false };
+  return { value: undefined, changed: true };
+}
+
+/**
+ * Normalizes one option record: maps `aside` to `description` (a common
+ * provider-only decoration), drops non-string descriptions, and strips every
+ * unknown key. Returns the original when nothing needs changing.
+ */
+function normalizeOptionValue(option: unknown): { value: unknown; changed: boolean } {
+  if (!isRecord(option) || typeof option.label !== "string") {
+    return { value: option, changed: false };
+  }
+  let changed = Object.keys(option).some((key) => !OPTION_ALLOWED_KEYS.includes(key));
+  let description = option.description;
+  if (description === undefined && typeof option.aside === "string") {
+    description = Array.from(option.aside).slice(0, MAX_OPTION_DESCRIPTION_LENGTH).join("");
+    changed = true;
+  } else if (description !== undefined && typeof description !== "string") {
+    description = undefined;
+    changed = true;
+  }
+  if (option.aside !== undefined) changed = true;
+  if (!changed) return { value: option, changed: false };
+  const cleaned: Record<string, unknown> = { label: option.label };
+  if (description !== undefined) cleaned.description = description;
+  return { value: cleaned, changed: true };
+}
+
+/**
+ * Normalizes one question record: strips unknown keys, drops null/empty
+ * header and context values, coerces optional/multiSelect to real booleans,
+ * and normalizes every option. Returns the original when unchanged.
+ */
+function normalizeQuestionValue(question: unknown): { value: unknown; changed: boolean } {
+  if (!isRecord(question)) return { value: question, changed: false };
+  let changed = Object.keys(question).some((key) => !QUESTION_ALLOWED_KEYS.includes(key));
+
+  const header = normalizedText(question.header, Object.prototype.hasOwnProperty.call(question, "header"));
+  const context = normalizedText(question.context, Object.prototype.hasOwnProperty.call(question, "context"));
+  if (header.changed || context.changed) changed = true;
+
+  let optional: boolean | undefined;
+  if (Object.prototype.hasOwnProperty.call(question, "optional")) {
+    const coerced = coerceBooleanFlag(question.optional);
+    optional = coerced;
+    if (coerced !== question.optional) changed = true;
+  }
+  let multiSelect: boolean | undefined;
+  if (Object.prototype.hasOwnProperty.call(question, "multiSelect")) {
+    const coerced = coerceBooleanFlag(question.multiSelect);
+    multiSelect = coerced;
+    if (coerced !== question.multiSelect) changed = true;
+  }
+
+  let options = question.options;
+  if (Array.isArray(options)) {
+    let optionsChanged = false;
+    const cleanedOptions = options.map((option) => {
+      const result = normalizeOptionValue(option);
+      if (result.changed) optionsChanged = true;
+      return result.value;
+    });
+    if (optionsChanged) {
+      changed = true;
+      options = cleanedOptions;
+    }
+  }
+
+  if (!changed) return { value: question, changed: false };
+  const cleaned: Record<string, unknown> = { id: question.id, question: question.question, options };
+  if (header.value !== undefined) cleaned.header = header.value;
+  if (context.value !== undefined) cleaned.context = context.value;
+  if (optional !== undefined) cleaned.optional = optional;
+  if (multiSelect !== undefined) cleaned.multiSelect = multiSelect;
+  return { value: cleaned, changed: true };
+}
+
+/**
+ * Normalizes common provider-only decoration and noise without weakening the
+ * public schema. Non-strict emitters (DeepSeek, Claude, OpenRouter proxies)
+ * routinely add extra keys, string booleans, or null optional fields; this
+ * strips or coerces them so the strict parse and validation only ever see
+ * canonical input. Returns the original reference when nothing changed.
+ */
 export function normalizeAskUserArguments(args: unknown): unknown {
   if (!isRecord(args) || !Array.isArray(args.questions)) return args;
-  let changed = false;
+  let changed = Object.keys(args).some((key) => !ARGS_ALLOWED_KEYS.includes(key));
+
+  const context = normalizedText(args.context, Object.prototype.hasOwnProperty.call(args, "context"));
+  if (context.changed) changed = true;
+
   const questions = args.questions.map((question) => {
-    if (!isRecord(question) || !Array.isArray(question.options)) return question;
-    let questionChanged = false;
-    const options = question.options.map((option) => {
-      if (!isRecord(option) || !("aside" in option)) return option;
-      changed = true;
-      questionChanged = true;
-      const { aside, ...normalized } = option;
-      if (normalized.description === undefined && typeof aside === "string") {
-        normalized.description = Array.from(aside).slice(0, MAX_OPTION_DESCRIPTION_LENGTH).join("");
-      }
-      return normalized;
-    });
-    return questionChanged ? { ...question, options } : question;
+    const result = normalizeQuestionValue(question);
+    if (result.changed) changed = true;
+    return result.value;
   });
-  return changed ? { ...args, questions } : args;
+
+  if (!changed) return args;
+  const cleaned: Record<string, unknown> = { questions };
+  if (context.value !== undefined) cleaned.context = context.value;
+  return cleaned;
 }
 
 export class InteractionQueue {
@@ -571,7 +682,7 @@ export function renderAskUserCall(
   if (!argsComplete) return new Text(text, 0, 0);
   text += " ";
   try {
-    const input = parseAskUserArguments(args);
+    const input = parseAskUserArguments(normalizeAskUserArguments(args));
     if (input.questions.length === 1) {
       const question = input.questions[0];
       if (question === undefined) return new Text(text, 0, 0);
